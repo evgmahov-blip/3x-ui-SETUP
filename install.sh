@@ -21,21 +21,22 @@ INSTALL_RADIO_STUB="${INSTALL_RADIO_STUB:-yes}"
 XUI_VERSION="${XUI_VERSION:-3.7.0}"
 WEBROOT="${WEBROOT:-/var/www/mstream}"
 
-# tr exits with SIGPIPE when head has collected enough bytes. With global
-# `set -o pipefail` that becomes exit code 141 and aborts the installer.
-# Disable pipefail only inside these bounded random generators.
 rand_alnum() {
-  (
-    set +o pipefail
-    tr -dc 'a-z0-9' </dev/urandom | head -c "${1:-16}"
-  )
+  local n="${1:-16}"
+  local out
+  set +o pipefail
+  out="$(tr -dc 'a-z0-9' </dev/urandom | head -c "$n")"
+  set -o pipefail
+  printf '%s' "$out"
 }
 
 rand_pass() {
-  (
-    set +o pipefail
-    tr -dc 'A-Za-z0-9_!@#%+=' </dev/urandom | head -c "${1:-24}"
-  )
+  local n="${1:-24}"
+  local out
+  set +o pipefail
+  out="$(tr -dc 'A-Za-z0-9_!@#%+=' </dev/urandom | head -c "$n")"
+  set -o pipefail
+  printf '%s' "$out"
 }
 
 if [ -z "$DOMAIN" ]; then
@@ -106,7 +107,7 @@ fi
 
 install_packages
 
-echo "[2/13] Получаю сертификат Let's Encrypt"
+echo '[2/13] Получаю сертификат Let\x27s Encrypt'
 if systemctl is-active --quiet caddy 2>/dev/null; then
   systemctl stop caddy
 fi
