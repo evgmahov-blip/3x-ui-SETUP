@@ -21,6 +21,12 @@
 ## Быстрый запуск
 
 ```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/evgmahov-blip/3x-ui-SETUP/main/install.sh)
+```
+
+Либо сохранить скрипт локально:
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/evgmahov-blip/3x-ui-SETUP/main/install.sh -o /root/install-3xui-happ-node.sh
 chmod 700 /root/install-3xui-happ-node.sh
 /root/install-3xui-happ-node.sh
@@ -32,6 +38,26 @@ chmod 700 /root/install-3xui-happ-node.sh
 - email для Let's Encrypt
 
 Остальные параметры генерируются автоматически.
+
+## Важно: URL подписки
+
+`SUB_PORT=2096` — это **только внутренний HTTPS listener 3x-ui**.
+
+Он намеренно слушает `127.0.0.1:2096` и **не должен открываться наружу**.
+
+Правильная публичная Happ subscription всегда идёт через Caddy на TCP/443:
+
+```text
+https://stream.example.com/<random-sub-path>/<sub-id>
+```
+
+Неправильно:
+
+```text
+https://stream.example.com:2096/<random-sub-path>/<sub-id>
+```
+
+Если в Happ была сохранена старая ссылка с `:2096`, её нужно удалить и добавить заново правильный URL без порта. Простого редактирования старой записи может быть недостаточно, если клиент сохранил исходный source URL.
 
 ## Переменные окружения
 
@@ -124,6 +150,8 @@ Deploy-hook Certbot после обновления:
 /<xhttp-path>/*        -> HTTP  127.0.0.1:18443
 ```
 
+Публичный клиент при этом обращается только к `https://<domain>/<subscription-path>/<sub-id>` через TCP/443.
+
 После включения SSL на панели 3x-ui subscription backend также работает по HTTPS, поэтому Caddy подключается к `127.0.0.1:2096` через TLS и проверяет сертификат по DNS-имени ноды.
 
 Caddy слушает только HTTP/1.1 и HTTP/2, поэтому UDP/443 остаётся свободным для Hysteria2.
@@ -160,6 +188,8 @@ RU/private -> DIRECT
 
 Скрипт специально не меняет firewall автоматически, чтобы не потерять SSH-доступ на удалённой машине.
 
+**Не открывайте `2096/tcp` наружу.** Подписка публикуется через Caddy на `443/tcp`.
+
 ## Проверка после установки
 
 Ожидаемые listeners:
@@ -179,6 +209,8 @@ TCP 8000               x-ui panel HTTPS
 vless://...
 hysteria2://...
 ```
+
+Инсталлятор дополнительно проверяет публичный subscription URL через Caddy, наличие двух профилей и то, что backend `2096` не опубликован как внешний listener.
 
 ## Обновление
 
