@@ -95,19 +95,27 @@ wait_http() {
 }
 
 echo '[1/13] Предварительные проверки'
-RESOLVED_IP="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')"
+RESOLVED_IP="$( (getent ahostsv4 "$DOMAIN" 2>/dev/null || true) | awk 'NR==1{print $1}' )"
 PUBLIC_IP="$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
 echo "Domain:      $DOMAIN"
 echo "DNS IPv4:    ${RESOLVED_IP:-не найден}"
 echo "Public IPv4: ${PUBLIC_IP:-не определён}"
-if [ -n "$PUBLIC_IP" ] && [ -n "$RESOLVED_IP" ] && [ "$PUBLIC_IP" != "$RESOLVED_IP" ]; then
+
+if [ -z "$RESOLVED_IP" ]; then
+  echo '[ОШИБКА] DNS имя пока не резолвится в IPv4. Проверьте A-запись домена.'
+  exit 1
+fi
+
+if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "$RESOLVED_IP" ]; then
   echo '[ОШИБКА] DNS A-запись не указывает на этот сервер.'
+  echo "Ожидался IP сервера: $PUBLIC_IP"
+  echo "DNS сейчас отдаёт:   $RESOLVED_IP"
   exit 1
 fi
 
 install_packages
 
-echo '[2/13] Получаю сертификат Let\x27s Encrypt'
+echo "[2/13] Получаю сертификат Let's Encrypt"
 if systemctl is-active --quiet caddy 2>/dev/null; then
   systemctl stop caddy
 fi
@@ -140,7 +148,7 @@ PANEL_PATH="${XUI_WEB_BASE_PATH:-$PANEL_PATH}"
 PANEL_PATH="$(normalize_path "$PANEL_PATH")"
 API_TOKEN="${XUI_API_TOKEN:-}"
 if [ -z "$API_TOKEN" ]; then
-  API_TOKEN="$(/usr/local/x-ui/x-ui setting -getApiToken 2>/dev/null | tail -n1 | xargs)"
+  API_TOKEN="$(/usr/local/x-ui/x-ui setting -getApiToken 2>/dev/null | tail -n1 | xargs || true)"
 fi
 [ -n "$API_TOKEN" ] || { echo '[ОШИБКА] Не удалось получить API token 3x-ui.'; exit 1; }
 
@@ -177,8 +185,8 @@ RESP="$(api_post 'panel/api/inbounds/add' "$HY2_BODY")"
 printf '%s' "$RESP" | jq -e '.success == true' >/dev/null
 
 INBOUNDS="$(api_get 'panel/api/inbounds/list')"
-XHTTP_ID="$(printf '%s' "$INBOUNDS" | jq -r '.obj[] | select(.remark=="VLESS XHTTP") | .id' | head -n1)"
-HY2_ID="$(printf '%s' "$INBOUNDS" | jq -r '.obj[] | select(.remark=="Hysteria2") | .id' | head -n1)"
+XHTTP_ID="$(printf '%s' "$INBOUNDS" | jq -r 'first(.obj[] | select(.remark=="VLESS XHTTP") | .id) // empty')"
+HY2_ID="$(printf '%s' "$INBOUNDS" | jq -r 'first(.obj[] | select(.remark=="Hysteria2") | .id) // empty')"
 [ -n "$XHTTP_ID" ] && [ -n "$HY2_ID" ] || { echo '[ОШИБКА] Не найдены ID inbound-ов.'; exit 1; }
 
 echo '[7/13] Создаю одного клиента на оба inbound-а'
