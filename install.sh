@@ -85,13 +85,49 @@ install_packages() {
   fi
 }
 
-wait_http() {
-  local url="$1"
-  for _ in $(seq 1 30); do
-    curl -fsS "$url" >/dev/null 2>&1 && return 0
-    sleep 1
-  done
+detect_panel_scheme() {
+  local path="${PANEL_PATH:-/}"
+  local url
+
+  url="http://127.0.0.1:${PANEL_PORT}${path}"
+  if curl -sS --max-time 5 -o /dev/null "$url" 2>/dev/null; then
+    printf 'http'
+    return 0
+  fi
+
+  url="https://127.0.0.1:${PANEL_PORT}${path}"
+  if curl -ksS --max-time 5 -o /dev/null "$url" 2>/dev/null; then
+    printf 'https'
+    return 0
+  fi
+
   return 1
+}
+
+set_panel_api() {
+  local scheme
+  scheme="$(detect_panel_scheme)" || {
+    echo '[ОШИБКА] Не удалось определить HTTP/HTTPS протокол панели 3x-ui.' >&2
+    echo "Порт панели: ${PANEL_PORT}; путь: ${PANEL_PATH}" >&2
+    return 1
+  }
+  PANEL_SCHEME="$scheme"
+  API="${PANEL_SCHEME}://127.0.0.1:${PANEL_PORT}${PANEL_PATH%/}"
+  echo "[OK] API панели: ${PANEL_SCHEME}://127.0.0.1:${PANEL_PORT}${PANEL_PATH}"
+}
+
+api_get() {
+  curl -kfsS --max-time 15 \
+    -H "Authorization: Bearer ${API_TOKEN}" \
+    "${API}/${1#/}"
+}
+
+api_post() {
+  curl -kfsS --max-time 15 \
+    -H "Authorization: Bearer ${API_TOKEN}" \
+    -H 'Content-Type: application/json' \
+    -X POST "${API}/${1#/}" \
+    -d "${2:-{}}"
 }
 
 echo '[1/13] Предварительные проверки'
@@ -152,11 +188,7 @@ if [ -z "$API_TOKEN" ]; then
 fi
 [ -n "$API_TOKEN" ] || { echo '[ОШИБКА] Не удалось получить API token 3x-ui.'; exit 1; }
 
-API="http://127.0.0.1:${PANEL_PORT}${PANEL_PATH%/}"
-api_get() { curl -fsS -H "Authorization: Bearer ${API_TOKEN}" "${API}/${1#/}"; }
-api_post() { curl -fsS -H "Authorization: Bearer ${API_TOKEN}" -H 'Content-Type: application/json' -X POST "${API}/${1#/}" -d "${2:-{}}"; }
-
-wait_http "http://127.0.0.1:${PANEL_PORT}${PANEL_PATH}" || true
+set_panel_api
 
 echo '[4/13] Настраиваю Happ subscription'
 ROUTING_JSON="$(jq -cn '{Name:"RU DIRECT",GlobalProxy:"true",DirectSites:["geosite:category-ru"],DirectIp:["geoip:ru","geoip:private","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16"],ProxySites:[],ProxyIp:[],BlockSites:[],BlockIp:[],DomainStrategy:"IPIfNonMatch",FakeDNS:"false"}')"
@@ -171,8 +203,7 @@ RESP="$(api_post 'panel/api/setting/update' "$OBJ")"
 printf '%s' "$RESP" | jq -e '.success == true' >/dev/null
 systemctl restart x-ui
 sleep 3
-
-API="http://127.0.0.1:${PANEL_PORT}${PANEL_PATH%/}"
+set_panel_api
 
 echo '[5/13] Создаю VLESS/XHTTP inbound'
 XHTTP_BODY="$(jq -cn --arg path "$XHTTP_PATH" --arg domain "$DOMAIN" --argjson port "$XHTTP_PORT" '{up:0,down:0,total:0,remark:"VLESS XHTTP",enable:true,expiryTime:0,listen:"127.0.0.1",port:$port,protocol:"vless",settings:{clients:[],decryption:"none",fallbacks:[]},streamSettings:{network:"xhttp",security:"none",externalProxy:[{forceTls:"tls",dest:$domain,port:443,remark:"public",show:true}],xhttpSettings:{path:$path,host:$domain,mode:"packet-up",xPaddingBytes:"100-1000",xPaddingObfsMode:true,xPaddingKey:"_dc",xPaddingHeader:"X-Cache",xPaddingPlacement:"queryInHeader",xPaddingMethod:"tokenish",sessionIDPlacement:"cookie",sessionIDKey:"sid",sessionIDTable:"Base62",sessionIDLength:"16-32",seqPlacement:"cookie",seqKey:"seq",scMaxBufferedPosts:30,scStreamUpServerSecs:"20-80",noSSEHeader:false,serverMaxHeaderBytes:0,headers:{},enableXmux:false}},sniffing:{enabled:true,destOverride:["http","tls","quic","fakedns"],metadataOnly:false,routeOnly:true}}')"
