@@ -14,6 +14,8 @@ DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
 PANEL_PORT="${PANEL_PORT:-8000}"
 XHTTP_PORT="${XHTTP_PORT:-18443}"
+# SUB_PORT — только внутренний listener 3x-ui. Наружу его НЕ открываем.
+# Публичная подписка всегда работает через Caddy TCP/443 без :2096 в URL.
 SUB_PORT="${SUB_PORT:-2096}"
 CLIENT_NAME="${CLIENT_NAME:-main}"
 INSTALL_RADIO_STUB="${INSTALL_RADIO_STUB:-yes}"
@@ -91,8 +93,13 @@ set_panel_api() {
 api_get() {
   curl -kfsS --max-time 20 -H "Authorization: Bearer ${API_TOKEN}" "${API}/${1#/}"
 }
+
 api_post() {
-  curl -kfsS --max-time 20 -H "Authorization: Bearer ${API_TOKEN}" -H 'Content-Type: application/json' -X POST "${API}/${1#/}" -d "${2:-{}}"
+  curl -kfsS --max-time 20 \
+    -H "Authorization: Bearer ${API_TOKEN}" \
+    -H 'Content-Type: application/json' \
+    -X POST "${API}/${1#/}" \
+    -d "${2:-{}}"
 }
 
 echo '[1/13] Предварительные проверки'
@@ -120,7 +127,6 @@ CERT_DIR="/etc/caddy/certs/${DOMAIN}"
 install -d -o root -g caddy -m 0750 "$CERT_DIR"
 install -o root -g caddy -m 0640 "$LE_DIR/fullchain.pem" "$CERT_DIR/fullchain.pem"
 install -o root -g caddy -m 0640 "$LE_DIR/privkey.pem" "$CERT_DIR/privkey.pem"
-
 if ! sudo -u caddy test -r "$CERT_DIR/fullchain.pem" || ! sudo -u caddy test -r "$CERT_DIR/privkey.pem"; then
   echo '[ОШИБКА] Пользователь caddy не может прочитать сертификат.'
   exit 1
@@ -142,7 +148,9 @@ rm -f /tmp/3x-ui-install.sh
 PANEL_PORT="${XUI_PANEL_PORT:-$PANEL_PORT}"
 PANEL_PATH="$(normalize_path "${XUI_WEB_BASE_PATH:-$PANEL_PATH}")"
 API_TOKEN="${XUI_API_TOKEN:-}"
-if [ -z "$API_TOKEN" ]; then API_TOKEN="$(/usr/local/x-ui/x-ui setting -getApiToken 2>/dev/null | tail -n1 | xargs || true)"; fi
+if [ -z "$API_TOKEN" ]; then
+  API_TOKEN="$(/usr/local/x-ui/x-ui setting -getApiToken 2>/dev/null | tail -n1 | xargs || true)"
+fi
 [ -n "$API_TOKEN" ] || { echo '[ОШИБКА] Не удалось получить API token 3x-ui.'; exit 1; }
 set_panel_api
 
@@ -153,7 +161,21 @@ HAPP_ROUTING="happ://routing/onadd/${ROUTING_B64}"
 SETTINGS="$(api_post 'panel/api/setting/all' '{}')"
 printf '%s' "$SETTINGS" | jq -e '.success == true' >/dev/null
 OBJ="$(printf '%s' "$SETTINGS" | jq '.obj')"
-OBJ="$(printf '%s' "$OBJ" | jq --arg domain "$DOMAIN" --arg listen '127.0.0.1' --arg path "$SUB_PATH" --arg routing "$HAPP_ROUTING" --argjson port "$SUB_PORT" '.subListen=$listen | .subPort=$port | .subPath=$path | .subDomain=$domain | .subEnable=true | .subEncrypt=true | .subEnableRouting=true | .subRoutingRules=$routing')"
+OBJ="$(printf '%s' "$OBJ" | jq \
+  --arg domain "$DOMAIN" \
+  --arg listen '127.0.0.1' \
+  --arg path "$SUB_PATH" \
+  --arg routing "$HAPP_ROUTING" \
+  --argjson port "$SUB_PORT" \
+  '.subListen=$listen
+   | .subPort=$port
+   | .subPath=$path
+   | .subDomain=$domain
+   | .subEnable=true
+   | .subEncrypt=true
+   | .subUpdates="1"
+   | .subEnableRouting=true
+   | .subRoutingRules=$routing')"
 RESP="$(api_post 'panel/api/setting/update' "$OBJ")"
 printf '%s' "$RESP" | jq -e '.success == true' >/dev/null
 systemctl restart x-ui
@@ -188,8 +210,9 @@ HY2_ID="$(printf '%s' "$INBOUNDS" | jq -r 'first(.obj[]? | select(.remark=="Hyst
 [ -n "$XHTTP_ID" ] && [ -n "$HY2_ID" ] || { echo '[ОШИБКА] Не найдены ID inbound-ов.'; exit 1; }
 
 echo '[7/13] Создаю одного клиента на оба inbound-а'
-CLIENTS="$(api_get 'panel/api/clients/list' 2>/dev/null || true)"
-CLIENT_EXISTS="$(printf '%s' "$CLIENTS" | jq -r --arg email "$CLIENT_NAME" 'first(.obj[]? | select(.client.email==$email) | .client.email) // empty' 2>/dev/null || true)"
+# Не используем /clients/list для проверки: его форма менялась между версиями 3x-ui.
+# Источник истины — settings.clients[] самих inbound-ов.
+CLIENT_EXISTS="$(printf '%s' "$INBOUNDS" | jq -r --arg email "$CLIENT_NAME" 'first(.obj[]? | .settings.clients[]? | select(.email==$email) | .email) // empty')"
 if [ -z "$CLIENT_EXISTS" ]; then
   CLIENT_BODY="$(jq -cn --arg email "$CLIENT_NAME" --arg subId "$SUB_ID" --argjson xhttp "$XHTTP_ID" --argjson hy2 "$HY2_ID" '{client:{email:$email,enable:true,expiryTime:0,totalGB:0,limitIp:0,subId:$subId},inboundIds:[$xhttp,$hy2]}')"
   RESP="$(api_post 'panel/api/clients/add' "$CLIENT_BODY")"
@@ -200,6 +223,15 @@ fi
 systemctl restart x-ui
 sleep 3
 set_panel_api
+
+# После создания/повторного запуска всегда читаем фактический SubID из inbound.
+INBOUNDS="$(api_get 'panel/api/inbounds/list')"
+SUB_ID="$(printf '%s' "$INBOUNDS" | jq -r --arg email "$CLIENT_NAME" 'first(.obj[]? | .settings.clients[]? | select(.email==$email) | .subId) // empty')"
+[ -n "$SUB_ID" ] || { echo '[ОШИБКА] У клиента отсутствует SubID.'; exit 1; }
+
+XHTTP_CLIENT_COUNT="$(printf '%s' "$INBOUNDS" | jq -r --arg email "$CLIENT_NAME" '[.obj[]? | select(.remark=="VLESS XHTTP") | .settings.clients[]? | select(.email==$email)] | length')"
+HY2_CLIENT_COUNT="$(printf '%s' "$INBOUNDS" | jq -r --arg email "$CLIENT_NAME" '[.obj[]? | select(.remark=="Hysteria2") | .settings.clients[]? | select(.email==$email)] | length')"
+[ "$XHTTP_CLIENT_COUNT" -ge 1 ] && [ "$HY2_CLIENT_COUNT" -ge 1 ] || { echo '[ОШИБКА] Клиент не привязан к обоим inbound-ам.'; exit 1; }
 
 echo '[8/13] Устанавливаю radio-stub-site'
 mkdir -p "$WEBROOT"
@@ -233,8 +265,14 @@ https://${DOMAIN}:443 {
     }
 
     @subscription path ${SUB_PATH}*
+    header @subscription Cache-Control "no-cache, no-store, must-revalidate"
+    header @subscription Pragma "no-cache"
+    header @subscription Expires "0"
     reverse_proxy @subscription https://127.0.0.1:${SUB_PORT} {
         header_up Host ${DOMAIN}
+        header_up X-Forwarded-Host ${DOMAIN}
+        header_up X-Forwarded-Port 443
+        header_up X-Forwarded-Proto https
         transport http {
             tls_server_name ${DOMAIN}
         }
@@ -282,26 +320,55 @@ systemctl restart x-ui
 HOOK
 chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/3xui-happ-node.sh
 
-echo '[12/13] Проверяю сервисы и подписку'
+echo '[12/13] Проверяю сервисы и ПУБЛИЧНУЮ подписку'
 systemctl is-active --quiet caddy
 systemctl is-active --quiet x-ui
 ss -lntup | grep -E ":(80|443|${PANEL_PORT}|${XHTTP_PORT}|${SUB_PORT})[[:space:]]" || true
+
+# 2096 обязан оставаться локальным.
+SUB_LISTEN="$(ss -lntp | awk -v p=":${SUB_PORT}" '$4 ~ p {print $4; exit}')"
+case "$SUB_LISTEN" in
+  127.0.0.1:${SUB_PORT}|[::1]:${SUB_PORT}) ;;
+  *) echo "[ОШИБКА] Subscription listener должен быть только localhost, сейчас: ${SUB_LISTEN:-не найден}"; exit 1 ;;
+esac
+
 SITE_CODE="$(curl -fsS --tlsv1.2 --tls-max 1.2 --max-time 10 -o /dev/null -w '%{http_code}' "https://${DOMAIN}/")"
 [ "$SITE_CODE" = '200' ] || { echo "[ОШИБКА] masking site HTTP=$SITE_CODE"; exit 1; }
+
+# ВАЖНО: публичный URL ВСЕГДА без :2096. 2096 — backend Caddy.
 SUB_URL="https://${DOMAIN}${SUB_PATH}${SUB_ID}"
+
+HEAD_CODE="$(curl -fsS -I -A 'Happ/1.0' --tlsv1.2 --tls-max 1.2 --max-time 15 -o /tmp/happ-sub.headers -w '%{http_code}' "$SUB_URL")"
+[ "$HEAD_CODE" = '200' ] || { echo "[ОШИБКА] Public subscription HEAD HTTP=$HEAD_CODE"; exit 1; }
+
 curl -fsS -A 'Happ/1.0' --tlsv1.2 --tls-max 1.2 --max-time 15 "$SUB_URL" -o /tmp/happ-sub.body
-LINK_COUNT="$(python3 - <<'PY'
+LINK_RESULT="$(python3 - <<'PY'
 import base64
 from pathlib import Path
-raw=Path('/tmp/happ-sub.body').read_bytes().strip()
+raw = Path('/tmp/happ-sub.body').read_bytes().strip()
 try:
-    txt=base64.b64decode(raw).decode('utf-8','replace')
+    txt = base64.b64decode(raw).decode('utf-8', 'replace')
 except Exception:
-    txt=raw.decode('utf-8','replace')
-print(sum(1 for x in txt.splitlines() if x.strip().startswith(('vless://','hysteria2://','hysteria://'))))
+    txt = raw.decode('utf-8', 'replace')
+schemes = []
+for x in txt.splitlines():
+    s = x.strip()
+    if s.startswith('vless://'):
+        schemes.append('VLESS')
+    elif s.startswith(('hysteria2://', 'hysteria://')):
+        schemes.append('HYSTERIA2')
+print('LINK_COUNT=' + str(len(schemes)))
+print('SCHEMES=' + ','.join(schemes))
 PY
 )"
-[ "$LINK_COUNT" -ge 2 ] || { echo "[ОШИБКА] В подписке найдено подключений: $LINK_COUNT"; exit 1; }
+printf '%s\n' "$LINK_RESULT"
+LINK_COUNT="$(printf '%s\n' "$LINK_RESULT" | awk -F= '/^LINK_COUNT=/{print $2}')"
+[ "${LINK_COUNT:-0}" -ge 2 ] || { echo "[ОШИБКА] В подписке найдено подключений: ${LINK_COUNT:-0}"; exit 1; }
+
+if grep -qE '(^|[[:space:]])https://[^[:space:]]+:2096/' /tmp/happ-sub.body 2>/dev/null; then
+  echo '[ОШИБКА] В публичной выдаче обнаружена ссылка с :2096.'
+  exit 1
+fi
 
 echo '[13/13] ГОТОВО'
 echo
@@ -316,6 +383,8 @@ echo 'Панельные реквизиты сохраните сейчас:'
 printf 'Username: %s\n' "$PANEL_USER"
 printf 'Password: %s\n' "$PANEL_PASS"
 echo
+echo '[ВАЖНО] Для Happ использовать ТОЛЬКО URL выше БЕЗ :2096.'
+echo "[ВАЖНО] Порт ${SUB_PORT}/TCP — внутренний backend 3x-ui на localhost, наружу его не открывать."
 echo '[ВАЖНО] TCP/443 работает через Caddy только TLS 1.2; Hysteria2 использует QUIC/TLS 1.3.'
 echo '[ВАЖНО] Панель пока слушает публичный порт. Ограничьте его firewall-ом после проверки.'
 echo "#################### КОНЕЦ ВЫВОДА: ${TASK} ####################"
