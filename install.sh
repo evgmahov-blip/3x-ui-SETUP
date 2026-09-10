@@ -50,11 +50,18 @@ PANEL_PATH="$(normalize_path "$PANEL_PATH")"
 SUB_PATH="$(normalize_path "$SUB_PATH")"
 XHTTP_PATH="$(normalize_path "$XHTTP_PATH")"
 
+apt_safe() {
+  # Ubuntu cloud-init/unattended-upgrades часто держат dpkg lock сразу после старта VPS.
+  # Не удаляем lock-файлы: apt ждёт до 5 минут и только потом возвращает ошибку.
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 "$@"
+}
+
 install_packages() {
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y curl jq openssl ca-certificates certbot git caddy python3
+    echo '[INFO] Ожидаю освобождения apt/dpkg lock при необходимости...'
+    apt_safe update
+    apt_safe install -y curl jq openssl ca-certificates certbot git caddy python3
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y epel-release || true
     dnf install -y curl jq openssl ca-certificates certbot git caddy python3
@@ -91,15 +98,37 @@ set_panel_api() {
 }
 
 api_get() {
-  curl -kfsS --max-time 20 -H "Authorization: Bearer ${API_TOKEN}" "${API}/${1#/}"
+  local endpoint="${1#/}" tmp code
+  tmp="$(mktemp)"
+  code="$(curl -ksS --max-time 20 -o "$tmp" -w '%{http_code}' \
+    -H "Authorization: Bearer ${API_TOKEN}" \
+    "${API}/${endpoint}")" || { rm -f "$tmp"; return 1; }
+  if [[ ! "$code" =~ ^2 ]]; then
+    echo "[ОШИБКА API] GET ${endpoint}: HTTP ${code}" >&2
+    cat "$tmp" >&2 || true
+    rm -f "$tmp"
+    return 1
+  fi
+  cat "$tmp"
+  rm -f "$tmp"
 }
 
 api_post() {
-  curl -kfsS --max-time 20 \
+  local endpoint="${1#/}" payload="${2:-{}}" tmp code
+  tmp="$(mktemp)"
+  code="$(curl -ksS --max-time 20 -o "$tmp" -w '%{http_code}' \
     -H "Authorization: Bearer ${API_TOKEN}" \
     -H 'Content-Type: application/json' \
-    -X POST "${API}/${1#/}" \
-    -d "${2:-{}}"
+    -X POST "${API}/${endpoint}" \
+    -d "$payload")" || { rm -f "$tmp"; return 1; }
+  if [[ ! "$code" =~ ^2 ]]; then
+    echo "[ОШИБКА API] POST ${endpoint}: HTTP ${code}" >&2
+    cat "$tmp" >&2 || true
+    rm -f "$tmp"
+    return 1
+  fi
+  cat "$tmp"
+  rm -f "$tmp"
 }
 
 echo '[1/13] Предварительные проверки'
@@ -139,6 +168,9 @@ export XUI_PASSWORD="$PANEL_PASS"
 export XUI_PANEL_PORT="$PANEL_PORT"
 export XUI_WEB_BASE_PATH="$PANEL_PATH"
 export XUI_SSL_MODE='none'
+# Fail2ban/IP Limit для этой ноды не нужен на этапе установки. Главное — не дать
+# upstream installer повторно полезть в apt/pip и столкнуться с cloud-init lock.
+export XUI_ENABLE_FAIL2BAN=false
 curl -fsSL "https://raw.githubusercontent.com/MHSanaei/3x-ui/v${XUI_VERSION}/install.sh" -o /tmp/3x-ui-install.sh
 bash /tmp/3x-ui-install.sh
 rm -f /tmp/3x-ui-install.sh
@@ -173,7 +205,7 @@ OBJ="$(printf '%s' "$OBJ" | jq \
    | .subDomain=$domain
    | .subEnable=true
    | .subEncrypt=true
-   | .subUpdates="1"
+   | .subUpdates=1
    | .subEnableRouting=true
    | .subRoutingRules=$routing')"
 RESP="$(api_post 'panel/api/setting/update' "$OBJ")"
